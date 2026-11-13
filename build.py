@@ -92,9 +92,11 @@ SECTIONS = [
 MARKET_TICKERS = [
     ("FTSE MIB", "FTSEMIB.MI", "{:,.0f}"),
     ("NASDAQ", "^IXIC", "{:,.0f}"),
-    ("EUR/USD", "EURUSD=X", "{:.3f}"),
-    ("BTC", "BTC-USD", "{:,.0f}"),
-    ("VIX", "^VIX", "{:.1f}"),
+    ("EURONEXT", "ENX.PA", "{:,.2f}"),
+    ("DIASORIN", "DIA.MI", "{:,.2f}"),
+    ("AMPLIFON", "AMP.MI", "{:,.2f}"),
+    ("WEBUILD", "WBD.MI", "{:,.2f}"),
+    ("LEONARDO", "LDO.MI", "{:,.2f}"),
 ]
 
 
@@ -666,7 +668,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <header>
     <div class="top-bar">
       <div>
-        <div class="brand-title">My<span>Brief</span></div>
+        <div class="brand-title">AI<span>Brief</span></div>
         <div class="brand-sub">PERSONAL INTELLIGENCE</div>
       </div>
       <div class="weather-box">
