@@ -2,8 +2,14 @@ name: Daily Brief
 
 on:
   schedule:
-    - cron: "15 5 * * *"
+    # Runs at :05 every hour from 06:05 to 19:05 UTC
+    # Covers 08:00–20:00 Milan time year-round (both winter CET & summer CEST)
+    - cron: "5 6-19 * * *"
   workflow_dispatch:
+  push:
+    paths:
+      - "build.py"
+      - "manifest.json"
 
 permissions:
   contents: read
