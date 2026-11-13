@@ -40,5 +40,5 @@ jobs:
           path: dist
       - id: deployment
         uses: actions/deploy-pages@v4
-        - run: pip install feedparser requests beautifulsoup4 yfinance
+      - run: pip install feedparser requests beautifulsoup4 yfinance
 
