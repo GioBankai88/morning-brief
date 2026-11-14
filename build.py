@@ -1718,7 +1718,7 @@ def build_html():
         )
     else:
         edition_note = (
-            "Aggiornato ogni ora 08:00–20:00 (Milano). Fonti dirette e titoli originali, "
+            "Aggiornato ogni ora. Fonti dirette e titoli originali, "
             "ordinati per rilevanza."
         )
 
