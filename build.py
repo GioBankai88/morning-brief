@@ -1,9 +1,14 @@
 import calendar
+import hashlib
 import html
 import json
+import math
 import os
 import re
-from datetime import datetime, timedelta, timezone
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -14,12 +19,189 @@ from bs4 import BeautifulSoup
 TZ_IT = ZoneInfo("Europe/Rome")
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MyBriefBot/1.0)"}
 
-BLOCKLIST = [
-    "oroscopo", "grande fratello", "sanremo", "gossip", "calciomercato",
-    "serie a", "champions league", "offerte amazon", "black friday",
-    "codice sconto", "sponsorizzato", "you won't believe", "watch:",
-    "live updates:", "jim cramer", "mad money"
+# ──────────────────────────────────────────────────────────────────────────
+# CONFIGURAZIONE
+# ──────────────────────────────────────────────────────────────────────────
+# Modello Gemini configurabile via variabile d'ambiente GEMINI_MODEL
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Serve all'AI per capire cosa è rilevante. Modificalo liberamente.
+READER_PROFILE = (
+    "professionista italiano dei servizi finanziari (post-trade), vive a Novara e fa il pendolare "
+    "in treno verso Milano; segue economia italiana, mercati, trasporti e tecnologia di uso quotidiano."
+)
+
+AI_CANDIDATES = 28   # quanti candidati (i migliori per punteggio) vede l'AI per ogni sezione
+MIN_ITEMS = 3        # minimo di notizie per sezione, anche se l'AI è molto selettivo
+
+
+def has_translator() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def P(*terms: str) -> "re.Pattern":
+    """Regex case-insensitive con confini di parola (evita match tipo 'pil' dentro 'pilota')."""
+    return re.compile(r"\b(?:" + "|".join(terms) + r")\b", re.IGNORECASE)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# FILTRO ANTI-RUMORE
+# ──────────────────────────────────────────────────────────────────────────
+BLOCK_SUBSTR = [
+    "you won't believe", "watch:", "live updates:", "jim cramer", "mad money",
+    "offerte amazon", "black friday", "codice sconto", "sponsorizzato",
 ]
+BLOCK_WORDS = P(
+    "oroscopo", "grande fratello", "sanremo", "gossip", "calciomercato", "serie a",
+    "champions league", "superenalotto", "isola dei famosi", "temptation island", "ricetta",
+)
+
+
+def is_blocked(blob: str) -> bool:
+    return any(s in blob for s in BLOCK_SUBSTR) or bool(BLOCK_WORDS.search(blob))
+
+
+# Titoli "da servizio/consiglio" invece che notizie (valgono per tutte le sezioni)
+GENERIC_PENALTY = P(r"cosa fare", r"ecco perch\w+", r"ecco come", r"scopri", r"top \d+", r"come risolvere")
+
+# Bonus alle agenzie (riportano fatti), malus a siti lifestyle/gaming che copiano notizie altrui
+SOURCE_ADJUST = [
+    (re.compile(r"ansa|adnkronos|\bagi\b|reuters|italpress|askanews|ap news", re.I), 1.0),
+    (re.compile(r"everyeye|io donna|iodonna|donna moderna", re.I), -2.0),
+]
+
+MONTHS_IT = {
+    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6, "luglio": 7,
+    "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12,
+}
+DATE_RX = re.compile(
+    r"\b(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)"
+    r"(?:\s+(\d{4}))?\b",
+    re.IGNORECASE,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# FONTI E REGOLE DI RILEVANZA PER SEZIONE
+# ──────────────────────────────────────────────────────────────────────────
+def feed(label, url, tag, lang="it", w=1.0, only=None, hours=None, fixed=False):
+    return {
+        "label": label, "url": url, "tag": tag, "lang": lang, "weight": w,
+        "only": only, "hours": hours, "fixed": fixed,
+    }
+
+
+def gnews(query: str, when: str = "1d", lang: str = "it") -> str:
+    q = quote_plus(f"{query} when:{when}")
+    if lang == "it":
+        return f"https://news.google.com/rss/search?q={q}&hl=it&gl=IT&ceid=IT:it"
+    return f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
+
+
+TECH_ALERT = P(
+    r"outage", r"outages", r"disservizi?", r"down", r"non funziona", r"non funzionano",
+    r"malfunzionament\w*", r"guast\w*", r"blackout", r"data breach", r"attacco informatico",
+    r"attacchi informatici", r"ransomware", r"vulnerabilit\w*", r"zero-day", r"cve-\d+",
+    r"violazione dei dati", r"hack\w*",
+)
+TECH_SERVICES = P(
+    r"outlook", r"microsoft 365", r"office 365", r"microsoft", r"teams", r"azure", r"aws",
+    r"amazon web services", r"google", r"gmail", r"cloudflare", r"whatsapp", r"instagram",
+    r"facebook", r"icloud", r"apple", r"spid", r"poste", r"pagopa", r"intesa", r"unicredit", r"paypal",
+)
+TECH_TOPICS = P(
+    r"openai", r"anthropic", r"nvidia", r"chatgpt", r"gemini", r"intelligenza artificiale", r"ai act",
+    r"semiconduttor\w*", r"chip", r"quantum\w*", r"cybersicurezza", r"cybersecurity",
+    r"regolament\w*", r"antitrust", r"dma",
+)
+NOVARA_CHIP = P(r"chip", r"microchip", r"chiplet", r"semiconduttor\w*", r"silicon box", r"vulcan project")
+
+TECH_OUTAGE = P(
+    r"outage", r"outages", r"disservizi?", r"down", r"non funziona", r"non funzionano",
+    r"malfunzionament\w*", r"guast\w*", r"blackout",
+)
+SERVICE_FAMILIES = [
+    ("microsoft", P(r"outlook", r"microsoft 365", r"office 365", r"microsoft", r"teams", r"azure")),
+    ("amazon", P(r"aws", r"amazon web services")),
+    ("google", P(r"google", r"gmail")),
+    ("meta", P(r"whatsapp", r"instagram", r"facebook")),
+    ("apple", P(r"apple", r"icloud")),
+    ("cloudflare", P(r"cloudflare")),
+    ("spid", P(r"spid")),
+    ("poste", P(r"poste", r"pagopa")),
+    ("banche", P(r"intesa", r"unicredit", r"paypal")),
+]
+
+
+def tech_topic(it):
+    """Chiave del disservizio (es. 'microsoft'): articoli diversi sullo stesso disservizio la condividono."""
+    if not TECH_OUTAGE.search(it["blob"]):
+        return None
+    for name, rx in SERVICE_FAMILIES:
+        if rx.search(it["blob"]):
+            return name
+    return None
+
+
+def tech_must(it) -> bool:
+    """Disservizio di un servizio digitale diffuso, riportato da almeno 2 testate: deve sempre comparire."""
+    return bool(tech_topic(it)) and it["coverage"] >= 2
+
+
+def novara_must(it) -> bool:
+    """Notizie recenti (ultime 72h) sull'investimento chip/semiconduttori a Novara: devono comparire."""
+    fresh = (datetime.now(timezone.utc) - it["dt"]) <= timedelta(hours=72)
+    return bool(fresh and NOVARA_CHIP.search(it["blob"]))
+
+
+# ── Temi: servono a evitare che una sola storia occupi tutta la sezione ──
+def topic_rules(*rules):
+    """rules: (nome_tema, regex). Restituisce una funzione che dà il tema di una notizia (primo match)."""
+    def fn(it):
+        for name, rx in rules:
+            if rx.search(it["blob"]):
+                return name
+        return None
+    return fn
+
+
+TECH_AI_TOPIC = P(r"openai", r"chatgpt", r"gemini", r"anthropic", r"intelligenza artificiale")
+TECH_CYBER_TOPIC = P(r"ransomware", r"attacco informatico", r"vulnerabilit\w*", r"data breach", r"cve-\d+", r"zero-day")
+
+
+def tech_topics(it):
+    outage = tech_topic(it)
+    if outage:
+        return outage
+    if TECH_AI_TOPIC.search(it["blob"]):
+        return "ai"
+    if TECH_CYBER_TOPIC.search(it["blob"]):
+        return "cyber"
+    return None
+
+
+italy_topic = topic_rules(("manovra", P(
+    r"manovra", r"legge di bilancio", r"finanziaria", r"legge finanziaria", r"parti sociali", r"palazzo chigi",
+    r"sindacat\w*", r"tagli", r"taglia\w*",
+)))
+markets_topic = topic_rules(
+    ("diasorin", P(r"diasorin")), ("amplifon", P(r"amplifon")), ("webuild", P(r"webuild")),
+    ("leonardo", P(r"leonardo")), ("euronext", P(r"euronext")),
+    ("indici", P(r"piazza affari", r"ftse mib", r"borsa italiana", r"borse europee", r"wall street", r"borsa")),
+)
+strikes_topic = topic_rules(
+    ("atm", P(r"atm")), ("trenord", P(r"trenord")),
+    ("treni", P(r"trenitalia", r"ferrovi\w*", r"treni", r"rfi", r"italo")),
+    ("aerei", P(r"aere\w*", r"voli", r"malpensa", r"linate", r"enav", r"enac")),
+    ("generale", P(r"sciopero generale")),
+)
+sanity_topic = topic_rules(
+    ("ucraina", P(r"ucraina", r"ukraine", r"kiev", r"kyiv", r"zelensky", r"donbass", r"mosca")),
+    ("medio oriente", P(r"iran", r"netanyahu", r"israele", r"israel", r"gaza", r"mossad", r"hormuz")),
+)
+novara_topic = topic_rules(("chip", NOVARA_CHIP))
+
 
 SECTIONS = [
     {
@@ -27,11 +209,32 @@ SECTIONS = [
         "label": "Italia",
         "hours": 30,
         "limit": 8,
+        "editorial": (
+            "Politica ed economia italiana: decisioni di governo e Parlamento, manovra, fisco, lavoro, "
+            "conti pubblici, Istat/Bankitalia/BCE. Escludi polemiche di partito senza fatti, gossip e cronaca locale."
+        ),
+        "priority": [
+            (P(r"manovra", r"legge di bilancio", r"decret\w*", r"fiducia", r"consiglio dei ministri",
+               r"meloni", r"giorgetti", r"istat", r"bankitalia", r"bce", r"spread", r"inflazione", r"pil", r"fisco",
+               r"pension\w*", r"stipendi", r"dazi", r"sanzion\w*", r"referendum", r"elezioni", r"riforma\w*"), 3.0),
+            (P(r"corte costituzionale", r"corte dei conti", r"consob", r"antitrust", r"bruxelles",
+               r"commissione europea", r"nato", r"mattarella"), 1.5),
+        ],
+        "penalty": [
+            (P(r"formula 1", r"f1", r"gran premio", r"motogp", r"calcio", r"juventus", r"tennis", r"sinner",
+               r"olimpiadi", r"campionato", r"pilota", r"campione\w*"), -3.0),
+        ],
+        "topic_key": italy_topic,
+        "topic_caps": {"*": 2},
         "feeds": [
-            ("ANSA Politica", "https://www.ansa.it/sito/notizie/politica/politica_rss.xml", "IT", None),
-            ("ANSA Economia", "https://www.ansa.it/sito/notizie/economia/economia_rss.xml", "IT", None),
-            ("Sole 24 Ore", "https://www.ilsole24ore.com/rss/economia.xml", "IT", None),
-            ("Il Post", "https://www.ilpost.it/feed/", "IT", r"governo|parlamento|manovra|economia|pil|fisco|lavoro|bce|decreto|meloni|giorgetti|inflazione"),
+            feed("ANSA Politica", "https://www.ansa.it/sito/notizie/politica/politica_rss.xml", "IT"),
+            feed("ANSA Economia", "https://www.ansa.it/sito/notizie/economia/economia_rss.xml", "IT"),
+            feed("Sole 24 Ore", "https://www.ilsole24ore.com/rss/economia.xml", "IT"),
+            feed("Il Post", "https://www.ilpost.it/feed/", "IT", w=0.9,
+                 only=P(r"governo", r"parlamento", r"manovra", r"economia", r"pil", r"fisco", r"lavoro", r"bce",
+                        r"decret\w*", r"meloni", r"giorgetti", r"inflazione")),
+            feed("Google News", gnews('(governo OR parlamento OR manovra OR "legge di bilancio" OR decreto OR Mattarella OR Meloni OR "consiglio dei ministri")'), "IT", w=0.9),
+            feed("Google News", gnews('(Istat OR Bankitalia OR Bce OR inflazione OR "conti pubblici" OR fisco OR pensioni)'), "IT", w=0.9),
         ],
     },
     {
@@ -39,11 +242,29 @@ SECTIONS = [
         "label": "Mercati",
         "hours": 30,
         "limit": 10,
+        "editorial": (
+            "Mercati finanziari: indici (FTSE MIB, Wall Street), BCE/Fed e tassi, petrolio, spread, risultati societari "
+            "rilevanti, regolamentazione finanziaria e post-trading (Euronext, Borsa Italiana, Consob, ESMA, CSDR, T+1). "
+            "Escludi consigli d'investimento, pubblicità e opinioni."
+        ),
+        "priority": [
+            (P(r"euronext", r"borsa italiana", r"consob", r"esma", r"csdr", r"t\+1", r"post-trade", r"monte titoli",
+               r"t2s", r"regolamento titoli", r"diasorin", r"amplifon", r"webuild", r"leonardo"), 4.0),
+            (P(r"piazza affari", r"ftse mib", r"wall street", r"bce", r"ecb", r"fed", r"federal reserve", r"tassi",
+               r"rialz\w*", r"ribass\w*", r"spread", r"petrolio", r"oil", r"brent", r"oro", r"gold", r"dollaro",
+               r"treasury", r"yields?", r"inflation\w*", r"earnings", r"utili", r"trimestral\w*", r"guidance",
+               r"ipo", r"opa", r"rating", r"downgrade", r"upgrade", r"s&p", r"nasdaq", r"dow"), 2.0),
+        ],
+        "topic_key": markets_topic,
+        "topic_caps": {"indici": 2, "*": 1},
         "feeds": [
-            ("Sole 24 Finanza", "https://www.ilsole24ore.com/rss/finanza.xml", "IT", None),
-            ("CNBC Europe", "https://www.cnbc.com/id/19794221/device/rss/rss.html", "EU", None),
-            ("CNBC Investing", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069", "US", None),
-            ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "US", None),
+            feed("Sole 24 Finanza", "https://www.ilsole24ore.com/rss/finanza.xml", "IT"),
+            feed("Google News", gnews('(Piazza Affari OR "Borsa di Milano" OR "FTSE MIB" OR "Wall Street" OR Bce OR Fed OR spread OR petrolio)'), "IT"),
+            feed("Google News", gnews('(Euronext OR "Borsa Italiana" OR Consob OR ESMA OR CSDR OR "T+1" OR post-trade OR "Monte Titoli" OR T2S OR "regolamento titoli")', "3d"), "FIN", hours=72),
+            feed("Google News", gnews('(Diasorin OR Amplifon OR Webuild OR Leonardo) (titolo OR azioni OR conti OR trimestrale OR guidance)', "2d"), "TITOLI", hours=48),
+            feed("CNBC Europe", "https://www.cnbc.com/id/19794221/device/rss/rss.html", "EU", lang="en", w=0.8),
+            feed("CNBC Investing", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069", "US", lang="en", w=0.8),
+            feed("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "US", lang="en", w=0.7),
         ],
     },
     {
@@ -51,10 +272,29 @@ SECTIONS = [
         "label": "Trasporti",
         "hours": 72,
         "limit": 8,
+        "editorial": (
+            "Trasporti: scioperi confermati o in corso (treni, aerei, trasporto pubblico) e disagi alla circolazione, "
+            "con priorità per Piemonte, Lombardia, tratta Novara-Milano, Malpensa. Escludi scioperi già conclusi o "
+            "revocati e notizie senza impatto pratico."
+        ),
+        "priority": [
+            (P(r"sciopero", r"scioperi", r"scioperare"), 3.0),
+            (P(r"cancellat\w*", r"soppress\w*", r"sospes\w*", r"guasto", r"blocc\w*", r"ritard\w*", r"interrott\w*",
+               r"disagi\w*", r"nebbia", r"neve", r"allerta"), 2.0),
+            (P(r"novara", r"rho", r"milano", r"torino", r"piemonte", r"lombardia", r"malpensa", r"linate", r"trenord",
+               r"trenitalia", r"rfi", r"italo", r"enav", r"nazionale", r"generale"), 2.0),
+        ],
+        "temporal": True,          # penalizza scioperi con date già passate / "oggi" vecchio, premia le date imminenti
+        "topic_key": strikes_topic,
+        "topic_caps": {"*": 2},
         "feeds": [
-            ("MIT Scioperi", "https://scioperi.mit.gov.it/mit2/public/scioperi/rss", "MIT", r"aereo|ferroviario|generale|trasporto pubblico|piemonte|lombardia|nazionale"),
-            ("Trasporti IT", "https://news.google.com/rss/search?q=(sciopero+OR+scioperi)+(treni+OR+aerei+OR+voli+OR+Malpensa+OR+Trenord+OR+ENAV)+when:3d&hl=it&gl=IT&ceid=IT:it", "IT", None),
-            ("Aviation EU", "https://news.google.com/rss/search?q=(%22air+traffic%22+OR+%22flight+disruptions%22+OR+%22airport+strike%22)+Europe+when:2d&hl=en&gl=US&ceid=US:en", "EU", None),
+            feed("MIT Scioperi", "https://scioperi.mit.gov.it/mit2/public/scioperi/rss", "MIT", fixed=True,
+                 only=P(r"aere\w*", r"ferroviari\w*", r"generale", r"trasporto pubblico", r"piemonte", r"lombardia",
+                        r"nazionale", r"novara", r"milano", r"torino", r"trenord")),
+            feed("Google News", gnews('(sciopero OR scioperi) (treni OR ferrovie OR Trenord OR Trenitalia OR Italo OR aerei OR voli OR Malpensa OR Linate OR ENAV OR "trasporto pubblico")', "3d"), "IT", hours=72),
+            feed("Google News", gnews('(Trenord OR Trenitalia OR RFI OR "circolazione ferroviaria") (Novara OR Rho OR Milano OR Torino OR Piemonte OR Lombardia) (ritardi OR guasto OR sospesa OR cancellati OR sciopero)', "1d"), "IT", w=1.1, hours=36),
+            feed("Google News", gnews('(Malpensa OR Linate OR ENAV OR ENAC) (voli OR cancellati OR ritardi OR sciopero OR "controllori di volo")', "2d"), "EU", hours=48),
+            feed("Aviation EU", gnews('("air traffic" OR "flight disruptions" OR "airport strike") Europe', "2d", lang="en"), "EU", lang="en", w=0.6, hours=48),
         ],
     },
     {
@@ -62,29 +302,98 @@ SECTIONS = [
         "label": "Rischi",
         "hours": 36,
         "limit": 6,
+        "editorial": (
+            "Rischi globali: conflitti, tensioni geopolitiche, nucleare, sanzioni, attacchi informatici di grande portata, "
+            "shock energetici. Solo sviluppi concreti; escludi commenti, analisi di opinione e allarmismo."
+        ),
+        "priority": [
+            (P(r"guerra", r"war", r"ucraina", r"ukraine", r"russia\w*", r"nato", r"israele", r"israel", r"gaza", r"iran",
+               r"taiwan", r"cina", r"china", r"missil\w*", r"nucle\w*", r"cessate il fuoco", r"ceasefire", r"sanzion\w*",
+               r"sanctions", r"attacco", r"attack", r"cyber\w*", r"hormuz", r"mar rosso", r"red sea", r"golpe", r"coup"), 2.5),
+            (P(r"energia", r"gas", r"petrolio", r"oil", r"pandemia", r"terror\w*"), 1.5),
+        ],
+        "topic_key": sanity_topic,
+        "topic_caps": {"*": 2},
         "feeds": [
-            ("Crisis Group", "https://www.crisisgroup.org/rss", "RISK", None),
-            ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "WORLD", r"war|conflict|ukraine|russia|nato|gaza|israel|iran|china|taiwan|missile|ceasefire|nuclear|cyberattack|defense"),
+            feed("Crisis Group", "https://www.crisisgroup.org/rss", "RISK", lang="en", w=1.2),
+            feed("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "WORLD", lang="en",
+                 only=P(r"war", r"conflict", r"ukraine", r"russia", r"nato", r"gaza", r"israel", r"iran", r"china",
+                        r"taiwan", r"missile", r"ceasefire", r"nuclear", r"cyberattack", r"defen[cs]e")),
+            feed("Google News", gnews('(guerra OR Ucraina OR "Medio Oriente" OR Gaza OR Iran OR Taiwan OR Nato OR "cessate il fuoco" OR nucleare OR "attacco informatico")'), "WORLD"),
+            feed("ANSA Mondo", "https://www.ansa.it/sito/notizie/mondo/mondo_rss.xml", "WORLD",
+                 only=P(r"guerra", r"ucraina", r"russia\w*", r"nato", r"israele", r"gaza", r"iran", r"taiwan", r"cina",
+                        r"missil\w*", r"nucle\w*", r"cessate il fuoco", r"sanzion\w*", r"attacco")),
         ],
     },
     {
         "id": "tech",
         "label": "Tech",
         "hours": 36,
-        "limit": 5,
+        "limit": 6,
+        "editorial": (
+            "Tecnologia: disservizi in corso di servizi digitali di uso comune (Outlook/Microsoft 365, Teams, cloud, "
+            "WhatsApp, banche online), attacchi informatici e vulnerabilità gravi, AI e big tech, regolamentazione. "
+            "Includi sempre i disservizi in corso. Escludi recensioni, offerte e gadget."
+        ),
+        "priority": [
+            (TECH_ALERT, 5.0),
+            (TECH_SERVICES, 2.5),
+            (TECH_TOPICS, 1.5),
+        ],
+        "penalty": [
+            (P(r"offert\w*", r"sconti?", r"recension\w*", r"review", r"deals?", r"coupon", r"unboxing", r"hands-on"), -3.0),
+        ],
+        "merge_key": tech_topic,   # titoli diversi sullo stesso disservizio = più testate
+        "topic_key": tech_topics,
+        "topic_caps": {"ai": 2, "cyber": 2, "*": 1},
+        "must": tech_must,
+        "must_tag": "ALERT",
         "feeds": [
-            ("Hacker News", "https://hnrss.org/newest?points=250", "HN", None),
-            ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "TECH", r"ai|security|apple|google|chip|semiconductor|linux|open source|quantum|regulation"),
+            feed("Google News", gnews('(Outlook OR "Microsoft 365" OR Teams OR Azure OR AWS OR Cloudflare OR Google OR WhatsApp OR Instagram OR iCloud) (down OR outage OR disservizio OR "non funziona" OR malfunzionamento OR guasto)'), "TECH", w=1.2, hours=36),
+            feed("Google News", gnews('(cybersecurity OR "attacco informatico" OR ransomware OR vulnerabilità OR "data breach" OR "violazione dati")'), "SEC"),
+            feed("Google News", gnews('(OpenAI OR Anthropic OR Nvidia OR Gemini OR ChatGPT OR "intelligenza artificiale" OR Microsoft OR Apple OR Google) (annuncia OR lancia OR accordo OR regolamento OR investimento OR causa)'), "AI"),
+            feed("ANSA Tecnologia", "https://www.ansa.it/sito/notizie/tecnologia/tecnologia_rss.xml", "TECH"),
+            feed("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "SEC", lang="en", w=0.9),
+            feed("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "TECH", lang="en", w=0.8,
+                 only=P(r"ai", r"security", r"apple", r"google", r"microsoft", r"outage", r"chip", r"semiconductor\w*",
+                        r"linux", r"open source", r"quantum", r"regulation", r"privacy", r"cyber\w*")),
+            feed("Hacker News", "https://hnrss.org/newest?points=250", "HN", lang="en", w=0.7),
         ],
     },
     {
         "id": "novara",
         "label": "Novara",
-        "hours": 48,
+        "hours": 72,
         "limit": 7,
+        "editorial": (
+            "Novara e provincia: economia e imprese (investimenti, stabilimenti, chip e semiconduttori, Silicon Box), "
+            "lavoro, infrastrutture e trasporti, sanità, istituzioni e viabilità con impatto sulla vita quotidiana. "
+            "Escludi piccola cronaca nera senza rilevanza pubblica."
+        ),
+        "priority": [
+            (NOVARA_CHIP, 6.0),
+            (P(r"investiment\w*", r"stabiliment\w*", r"azienda", r"aziende", r"imprese", r"lavoro", r"assunzion\w*",
+               r"posti di lavoro", r"fabbrica", r"insediament\w*", r"pnrr", r"upo", r"universit\w*", r"ospedale",
+               r"sindaco", r"consiglio comunale", r"viabilit\w*", r"tangenziale", r"treni", r"stazione",
+               r"malpensa", r"aeroporto"), 2.0),
+        ],
+        "penalty": [
+            (P(r"furto", r"furti", r"rissa", r"truffa", r"spaccio", r"denunciat\w*", r"ubriac\w*", r"ladri"), -1.5),
+        ],
+        "topic_key": novara_topic,
+        "topic_caps": {"chip": 2},
+        "must": novara_must,
+        "must_tag": "CHIP",
         "feeds": [
-            ("Novara News", "https://news.google.com/rss/search?q=Novara+when:2d&hl=it&gl=IT&ceid=IT:it", "NO", None),
-            ("ANSA Piemonte", "https://www.ansa.it/piemonte/notizie/piemonte_rss.xml", "NO", r"novara|novarese|borgomanero|arona|galliate|trecate|malpensa"),
+            feed("Google News", gnews("Novara", "2d"), "NO", w=0.8, hours=48),
+            feed("Google News", gnews('(Novara OR novarese OR "Piemonte Orientale") (azienda OR imprese OR investimento OR stabilimento OR lavoro OR assunzioni OR economia)', "3d"), "NO", hours=72),
+            feed("Google News", gnews('(chip OR semiconduttori OR "Silicon Box" OR "Vulcan Project") Novara', "7d"), "NO", w=1.1, hours=168),
+            feed("Corriere di Novara", "https://www.corrieredinovara.it/feed/", "NO"),
+            feed("NovaraToday", "https://www.novaratoday.it/rss/", "NO"),
+            feed("Buongiorno Novara", "https://www.buongiornonovara.it/feed/", "NO"),
+            feed("ANSA Piemonte", "https://www.ansa.it/piemonte/notizie/piemonte_rss.xml", "NO",
+                 only=P(r"novara", r"novarese", r"borgomanero", r"arona", r"galliate", r"trecate", r"malpensa",
+                        r"cameri", r"silicon box")),
         ],
     },
 ]
@@ -100,7 +409,10 @@ MARKET_TICKERS = [
 ]
 
 
-def fetch_weather_novara() -> tuple[str, str]:
+# ──────────────────────────────────────────────────────────────────────────
+# METEO / MERCATI (invariati)
+# ──────────────────────────────────────────────────────────────────────────
+def _fetch_weather_once() -> tuple[str, str]:
     try:
         r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -110,7 +422,7 @@ def fetch_weather_novara() -> tuple[str, str]:
                 "current": "temperature_2m,weather_code",
                 "timezone": "Europe/Rome",
             },
-            timeout=8,
+            timeout=10,
         )
         r.raise_for_status()
         cur = r.json()["current"]
@@ -133,6 +445,15 @@ def fetch_weather_novara() -> tuple[str, str]:
         return icon, f"{temp}°"
     except Exception:
         return "·", ""
+
+
+def fetch_weather_novara() -> tuple[str, str]:
+    for attempt in range(2):
+        result = _fetch_weather_once()
+        if result[1]:
+            return result
+        time.sleep(1.5)
+    return "·", ""
 
 
 def build_sparkline_svg(points: list[float], color: str, gid: str) -> str:
@@ -171,7 +492,7 @@ def fetch_markets() -> list[dict]:
             closes_1d = hist_1d["Close"].dropna().tolist()
             if not closes_1h and not closes_1d:
                 continue
-            price = closes_1h[-1] if closes_1h else closes_1d[-1]
+            price = closes_1d[-1] if closes_1d else closes_1h[-1]
             prev = closes_1d[-2] if len(closes_1d) >= 2 else (closes_1h[0] if closes_1h else price)
             pct = ((price - prev) / prev) * 100 if prev else 0.0
 
@@ -199,6 +520,9 @@ def fetch_markets() -> list[dict]:
     return cards
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# UTILITY FEED
+# ──────────────────────────────────────────────────────────────────────────
 def clean_text(raw: str, max_len: int = 240) -> str:
     if not raw:
         return ""
@@ -231,13 +555,25 @@ def extract_image(entry) -> str:
 
 
 def fetch_feed(url: str):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        resp.raise_for_status()
-        return feedparser.parse(resp.content)
-    except Exception as e:
-        print(f"Warn: failed {url}: {e}")
-        return None
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=12)
+            resp.raise_for_status()
+            return feedparser.parse(resp.content)
+        except Exception as e:
+            if attempt == 1:
+                print(f"Warn: failed {url}: {e}")
+            else:
+                time.sleep(1)
+    return None
+
+
+def prefetch_feeds() -> dict:
+    """Scarica tutti i feed in parallelo (ogni URL una sola volta)."""
+    urls = sorted({f["url"] for sec in SECTIONS for f in sec["feeds"]})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(fetch_feed, urls))
+    return dict(zip(urls, results))
 
 
 def entry_dt(entry):
@@ -250,61 +586,88 @@ def entry_dt(entry):
 def rel_age(dt_utc: datetime, now_utc: datetime) -> str:
     mins = max(1, int((now_utc - dt_utc).total_seconds() // 60))
     if mins < 60:
-        return f"{mins}m ago"
+        return f"{mins}m fa"
     hrs = mins // 60
     if hrs < 24:
-        return f"{hrs}h ago"
-    return f"{hrs // 24}d ago"
+        return f"{hrs}h fa"
+    return f"{hrs // 24}g fa"
 
 
-def is_duplicate(title: str, seen_word_sets: list[set[str]]) -> bool:
-    words = set(re.findall(r"[a-zàèéìòù0-9]{4,}", title.lower()))
-    if not words:
-        return False
-    for prev in seen_word_sets:
-        overlap = len(words & prev) / max(1, min(len(words), len(prev)))
-        if overlap >= 0.65:
-            return True
-    seen_word_sets.append(words)
-    return False
+# ──────────────────────────────────────────────────────────────────────────
+# LINGUA
+# ──────────────────────────────────────────────────────────────────────────
+IT_WORDS = {
+    "il", "lo", "la", "le", "gli", "un", "uno", "una", "di", "del", "della", "dei", "delle", "degli", "dello",
+    "che", "per", "con", "non", "sono", "dal", "dalla", "nel", "nella", "nei", "nelle", "sul", "sulla", "anche",
+    "più", "come", "dopo", "tra", "fra", "al", "alla", "ai", "agli", "ha", "hanno", "sarà", "contro", "verso",
+    "ma", "se", "si", "è", "dall", "all", "nell", "sull",
+}
+EN_WORDS = {
+    "the", "of", "and", "to", "for", "on", "with", "as", "at", "by", "from", "is", "are", "was", "were", "will",
+    "after", "over", "new", "says", "say", "amid", "about", "into", "its", "that", "this", "his", "her", "has",
+    "have", "be", "not", "up", "out", "how", "why", "what", "could", "would", "may", "can", "than", "but", "an",
+}
 
 
-def collect_section(sec: dict, now_utc: datetime) -> list[dict]:
-    cutoff = now_utc - timedelta(hours=sec["hours"])
+def detect_lang(text: str, default: str = "it") -> str:
+    words = re.findall(r"[a-zàèéìòù']+", text.lower())
+    it = sum(w in IT_WORDS for w in words)
+    en = sum(w in EN_WORDS for w in words)
+    if en > it:
+        return "en"
+    if it > en:
+        return "it"
+    return default
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# RACCOLTA, DEDUPLICA (con conteggio fonti), PUNTEGGIO
+# ──────────────────────────────────────────────────────────────────────────
+STOPWORDS = {
+    "della", "delle", "dello", "degli", "nella", "nelle", "sono", "come", "dopo", "anche", "questo", "questa",
+    "with", "from", "this", "that", "have", "will", "after", "over", "into", "dalla", "sulla", "contro",
+}
+
+
+def title_words(title: str) -> set:
+    return {w for w in re.findall(r"[a-zàèéìòù0-9]{4,}", title.lower()) if w not in STOPWORDS}
+
+
+def collect_items(sec: dict, now_utc: datetime, cache: dict) -> list[dict]:
     items = []
-    seen_words = []
-
-    for source_label, url, tag, regex_filter in sec["feeds"]:
-        feed = fetch_feed(url)
-        if not feed or not getattr(feed, "entries", None):
+    for f in sec["feeds"]:
+        parsed = cache.get(f["url"])
+        if not parsed or not getattr(parsed, "entries", None):
             continue
+        cutoff = now_utc - timedelta(hours=f["hours"] or sec["hours"])
+        is_gn = "news.google.com" in f["url"]
 
-        for entry in feed.entries:
-            title = clean_text(entry.get("title", ""), 160)
+        for entry in parsed.entries[:60]:
+            title = clean_text(entry.get("title", ""), 400)
             link = entry.get("link", "#")
             if not title:
                 continue
 
-            display_source = source_label
-            if "news.google.com" in url and " - " in title:
-                title_part, src_part = title.rsplit(" - ", 1)
-                title = title_part.strip()
-                display_source = src_part.strip()
-
-            dt = entry_dt(entry)
-            if dt < cutoff and tag != "MIT":
+            source = f["label"]
+            if is_gn and " - " in title:
+                title, source = [s.strip() for s in title.rsplit(" - ", 1)]
+            title = clean_text(title, 170)
+            if not title:
                 continue
 
-            summary = clean_text(entry.get("summary") or entry.get("description") or "", 220)
+            dt = entry_dt(entry)
+            if dt < cutoff and not f["fixed"]:
+                continue
+
+            # Google News non fornisce un vero sommario (solo titolo + testata)
+            summary = "" if is_gn else clean_text(entry.get("summary") or entry.get("description") or "", 220)
             if summary.lower().startswith(title.lower()[:28]):
                 summary = ""
 
             blob = f"{title} {summary}".lower()
-            if any(bad in blob for bad in BLOCKLIST):
+            if is_blocked(blob):
                 continue
-            if regex_filter and not re.search(regex_filter, blob, re.IGNORECASE):
-                continue
-            if is_duplicate(title, seen_words):
+            if f["only"] and not f["only"].search(blob):
                 continue
 
             items.append({
@@ -314,38 +677,358 @@ def collect_section(sec: dict, now_utc: datetime) -> list[dict]:
                 "link": link,
                 "summary": summary,
                 "image": extract_image(entry),
-                "source": display_source,
-                "tag": tag,
+                "source": source,
+                "tag": f["tag"],
                 "dt": dt,
-                "age": rel_age(dt, now_utc),
+                "lang": detect_lang(f"{title} {summary}", f["lang"]),
+                "weight": f["weight"],
+                "fixed": f["fixed"],
+                "blob": blob,
+                "coverage": 1,
             })
-
-    items.sort(key=lambda x: x["dt"], reverse=True)
-    return items[: sec["limit"]]
+    return items
 
 
-def build_brief_bullets(collected: dict, strike_alert: bool) -> list[tuple[str, str]]:
+def cluster_items(items: list[dict]) -> list[dict]:
+    """Raggruppa le notizie sullo stesso fatto: ne tiene una sola e conta quante testate la riportano."""
+    ordered = sorted(items, key=lambda x: (-x["weight"], -x["dt"].timestamp()))
+    clusters = []
+    for it in ordered:
+        words = title_words(it["title"])
+        match = None
+        for c in clusters:
+            inter = len(words & c["words"])
+            need = max(2, min(3, len(words), len(c["words"])))
+            if inter >= need and inter / max(1, min(len(words), len(c["words"]))) >= 0.6:
+                match = c
+                break
+        if match:
+            match["sources"].add(it["source"])
+            rep = match["rep"]
+            if not rep["image"] and it["image"]:
+                rep["image"] = it["image"]
+            if not rep["summary"] and it["summary"] and rep["lang"] == it["lang"]:
+                rep["summary"] = it["summary"]
+        else:
+            clusters.append({"rep": it, "words": words, "sources": {it["source"]}})
+    out = []
+    for c in clusters:
+        c["rep"]["coverage"] = len(c["sources"])
+        c["rep"]["sources"] = set(c["sources"])
+        out.append(c["rep"])
+    return out
+
+
+def date_adjust(it: dict, now_utc: datetime) -> float:
+    """Per le sezioni 'temporal': scioperi con date già passate o 'oggi' di ieri = vecchi; date imminenti = utili."""
+    today = now_utc.astimezone(TZ_IT).date()
+    found = []
+    for d, m, y in DATE_RX.findall(it["blob"]):
+        try:
+            dt = date(int(y) if y else today.year, MONTHS_IT[m.lower()], int(d))
+        except ValueError:
+            continue
+        if not y and dt < today - timedelta(days=180):
+            try:
+                dt = dt.replace(year=dt.year + 1)
+            except ValueError:
+                continue
+        found.append(dt)
+    if found:
+        if any(today <= d <= today + timedelta(days=14) for d in found):
+            return 2.0
+        if all(d < today for d in found):
+            return -6.0
+        return 0.0
+    age_h = (now_utc - it["dt"]).total_seconds() / 3600
+    if age_h > 20 and re.search(r"\boggi\b", it["blob"]):
+        return -4.0
+    return 0.0
+
+
+STALE_TODAY = re.compile(
+    r"\boggi\s+(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)"
+    r"(?:\s+(\d{4}))?",
+    re.IGNORECASE,
+)
+
+
+def stale_today_penalty(blob: str, today: date) -> float:
+    """Titoli SEO tipo 'Borsa italiana oggi 13 novembre': se la data è passata, la notizia è superata."""
+    m = STALE_TODAY.search(blob)
+    if not m:
+        return 0.0
+    try:
+        d = date(int(m.group(3)) if m.group(3) else today.year, MONTHS_IT[m.group(2).lower()], int(m.group(1)))
+    except ValueError:
+        return 0.0
+    return -4.0 if d < today else 0.0
+
+
+def score_item(it: dict, sec: dict, now_utc: datetime) -> float:
+    if it["fixed"]:
+        recency = 2.5
+    else:
+        age_h = max(0.0, (now_utc - it["dt"]).total_seconds() / 3600)
+        recency = 5.0 * math.exp(-age_h / max(6.0, sec["hours"] / 3))
+    prio = min(10.0, sum(pts for rx, pts in sec.get("priority", []) if rx.search(it["blob"])))
+    pen = sum(pts for rx, pts in sec.get("penalty", []) if rx.search(it["blob"]))
+    if GENERIC_PENALTY.search(it["blob"]):
+        pen -= 2.5
+    if not sec.get("temporal"):   # nelle sezioni "temporal" ci pensa già date_adjust()
+        pen += stale_today_penalty(it["blob"], now_utc.astimezone(TZ_IT).date())
+    cov = min(4.5, 1.5 * (it["coverage"] - 1))      # più testate indipendenti = più probabile rilevanza
+    if prio < 2.0:
+        cov *= 0.4                                    # ma una notizia fuori tema non vince solo per popolarità
+    src = (it["weight"] - 1.0) * 2 + sum(adj for rx, adj in SOURCE_ADJUST if rx.search(it["source"]))
+    extra = (0.3 if it["summary"] else 0.0) + (0.2 if it["image"] else 0.0)
+    if it["lang"] == "en" and not has_translator():
+        extra -= 0.8                                  # senza traduttore, meglio le fonti in italiano
+    temporal = date_adjust(it, now_utc) if sec.get("temporal") else 0.0
+    return recency + prio + pen + cov + src + extra + temporal
+
+
+def apply_topic_caps(sec: dict, ranked: list[dict]) -> list[dict]:
+    """Limita quante notizie della stessa storia/tema restano tra i candidati (le migliori per punteggio)."""
+    caps = sec.get("topic_caps", {})
+    default = caps.get("*", 2)
+    count, out = {}, []
+    for it in ranked:
+        topic = it.get("topic")
+        if topic:
+            if count.get(topic, 0) >= caps.get(topic, default):
+                continue
+            count[topic] = count.get(topic, 0) + 1
+        out.append(it)
+    return out
+
+
+def rank_section(sec: dict, now_utc: datetime, cache: dict) -> list[dict]:
+    cands = cluster_items(collect_items(sec, now_utc, cache))
+
+    # Titoli diversi sullo stesso evento (es. disservizio Outlook): contano come più testate
+    merge_fn = sec.get("merge_key")
+    if merge_fn:
+        groups = {}
+        for it in cands:
+            key = merge_fn(it)
+            it["merge"] = key
+            if key:
+                groups.setdefault(key, set()).update(it["sources"])
+        for it in cands:
+            if it.get("merge"):
+                it["coverage"] = max(it["coverage"], len(groups[it["merge"]]))
+
+    topic_fn = sec.get("topic_key")
+    must_fn = sec.get("must")
+    for it in cands:
+        it["topic"] = topic_fn(it) if topic_fn else None
+        it["score"] = score_item(it, sec, now_utc)
+        it["must"] = bool(must_fn and must_fn(it))
+        if it["must"] and sec.get("must_tag"):
+            it["tag"] = sec["must_tag"]
+    cands.sort(key=lambda x: x["score"], reverse=True)
+    return apply_topic_caps(sec, cands)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# AI (Gemini): solo per SCEGLIERE e TRADURRE. Non riscrive le notizie.
+# ──────────────────────────────────────────────────────────────────────────
+def gemini(prompt: str, as_json: bool = True, timeout: int = 45, retries: int = 2):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if api_key:
+    if not api_key:
+        return None
+    gen_cfg = {"temperature": 0.1, "thinkingConfig": {"thinkingBudget": 0}}
+    if as_json:
+        gen_cfg["responseMimeType"] = "application/json"
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
+
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                GEMINI_URL,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+            if r.status_code == 400 and "thinkingConfig" in gen_cfg:
+                gen_cfg.pop("thinkingConfig")   # alcuni modelli non accettano thinkingBudget
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(3 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if not as_json:
+                return text
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            return json.loads(text)
+        except Exception as e:
+            print(f"Warn: Gemini ({attempt + 1}/{retries + 1}): {e}")
+            if attempt < retries:
+                time.sleep(2)
+    return None
+
+
+def ai_pick(sec: dict, pool: list[dict]):
+    """L'AI sceglie gli id delle notizie che contano (testo originale intatto)."""
+    payload = [
+        {
+            "id": i,
+            "lang": it["lang"],
+            "fonti": it["coverage"],
+            "titolo": it["title"],
+            "testo": it["summary"][:160],
+        }
+        for i, it in enumerate(pool)
+    ]
+    prompt = (
+        "Sei il caporedattore di un brief informativo personale, sobrio e fattuale.\n"
+        f"Lettore: {READER_PROFILE}\n"
+        f"Sezione: {sec['label']}. Criterio editoriale: {sec['editorial']}\n\n"
+        f"Dai candidati qui sotto scegli le notizie che contano davvero oggi, al massimo {sec['limit']}, "
+        "in ordine di importanza. Meglio poche notizie rilevanti che molte irrilevanti.\n"
+        "Regole:\n"
+        "- Usa solo gli id forniti. Non inventare, non riscrivere, non unire notizie.\n"
+        "- Preferisci fatti concreti (decisioni, numeri, eventi, disservizi in corso) a opinioni, rubriche, "
+        "curiosità o titoli acchiappaclic.\n"
+        "- Se più candidati raccontano lo stesso fatto, scegline uno solo.\n"
+        "- Varietà: al massimo 2 notizie sullo stesso tema o evento; il resto della sezione deve coprire altri argomenti.\n"
+        "- Scarta titoli da servizio o clickbait (\"le migliori alternative\", \"cosa fare\", elenchi, consigli).\n"
+        "- Il campo 'fonti' indica quante testate diverse riportano la notizia: più fonti = più probabile rilevanza.\n"
+        "- Includi sempre i disservizi, gli scioperi e gli allarmi in corso che possono toccare il lettore.\n"
+        "- In 'non_it' elenca, tra gli id scelti, quelli il cui titolo NON è scritto in italiano.\n"
+        'Rispondi SOLO con JSON valido: {"ids": [id in ordine di importanza], "non_it": [id]}\n\n'
+        "Candidati:\n" + json.dumps(payload, ensure_ascii=False)
+    )
+    data = gemini(prompt)
+    if not isinstance(data, dict) or not isinstance(data.get("ids"), list):
+        return None
+    seen, chosen = set(), []
+    for v in data["ids"]:
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(pool) and i not in seen:
+            seen.add(i)
+            chosen.append(pool[i])
+    for v in data.get("non_it") or []:
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            continue
+        if i in seen:
+            pool[i]["lang"] = "en"
+    return chosen[: sec["limit"]] or None
+
+
+def heuristic_pick(sec: dict, ranked: list[dict]) -> list[dict]:
+    """Selezione senza AI: punteggio + massimo qualche articolo per testata."""
+    cap = 3 if sec["limit"] >= 6 else 2
+    chosen, skipped, per_src = [], [], {}
+    for it in ranked:
+        if len(chosen) >= sec["limit"]:
+            break
+        if len(chosen) >= MIN_ITEMS and it["score"] < 1.0:
+            continue                                  # solo ciò che conta: scarta il rumore
+        n = per_src.get(it["source"], 0)
+        if n >= cap:
+            skipped.append(it)
+            continue
+        chosen.append(it)
+        per_src[it["source"]] = n + 1
+    for it in skipped:
+        if len(chosen) >= sec["limit"]:
+            break
+        chosen.append(it)
+    chosen.sort(key=lambda x: x["score"], reverse=True)
+    return chosen
+
+
+def select_section(sec: dict, ranked: list[dict]) -> list[dict]:
+    if not ranked:
+        return []
+
+    chosen = None
+    if has_translator():
+        chosen = ai_pick(sec, ranked[:AI_CANDIDATES])
+
+    if chosen:
+        floor = min(MIN_ITEMS, len(ranked))
+        if len(chosen) < floor:
+            present = {id(x) for x in chosen}
+            for it in heuristic_pick(sec, ranked):
+                if id(it) not in present:
+                    chosen.append(it)
+                    if len(chosen) >= floor:
+                        break
+    else:
+        chosen = heuristic_pick(sec, ranked)
+
+    # Le notizie "must" (disservizi diffusi, investimento chip a Novara) non possono essere scartate
+    present = {id(x) for x in chosen}
+    forced = [it for it in ranked if it["must"] and id(it) not in present][:2]
+    return (forced + chosen)[: sec["limit"]]
+
+
+def translate_to_italian(items: list[dict]) -> None:
+    """Traduzione fedele dei titoli/sommari non italiani. Senza chiave API restano nell'originale."""
+    todo = [it for it in items if it["lang"] == "en"]
+    if not todo or not has_translator():
+        return
+    for start in range(0, len(todo), 25):
+        chunk = todo[start:start + 25]
+        payload = [{"id": i, "title": it["title"], "summary": it["summary"]} for i, it in enumerate(chunk)]
+        prompt = (
+            "Traduci in italiano i seguenti titoli e sommari di notizie.\n"
+            "Regole: traduzione fedele e letterale; non riassumere, non aggiungere né togliere informazioni, "
+            "non cambiare il tono; mantieni invariati nomi propri, sigle, cifre e valute. "
+            "Se un testo è già in italiano restituiscilo identico. Se 'summary' è vuoto lascialo vuoto.\n"
+            'Rispondi SOLO con JSON valido: {"items": [{"id": 0, "title": "...", "summary": "..."}]}\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        data = gemini(prompt)
+        rows = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            try:
+                it = chunk[int(row["id"])]
+                new_title = clean_text(str(row.get("title") or ""), 190)
+                new_sum = clean_text(str(row.get("summary") or ""), 240) if it["summary"] else ""
+            except Exception:
+                continue
+            if not new_title:
+                continue
+            if new_title.lower() != it["title"].lower():
+                it["source"] = f"{it['source']} (trad.)"
+            it["title"] = new_title
+            it["summary"] = new_sum
+            it["lang"] = "it"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# "TODAY IN 15 SECONDS"
+# ──────────────────────────────────────────────────────────────────────────
+def build_brief_bullets(collected: dict, strike_alert: bool) -> list[tuple[str, str]]:
+    if has_translator():
         lines = []
         for sec_id, items in collected.items():
             for it in items[:4]:
-                lines.append(f"[{sec_id.upper()}] {it['title']} — {it['summary'][:100]}")
+                extra = f" — {it['summary'][:100]}" if it["summary"] else ""
+                lines.append(f"[{sec_id.upper()}] {it['title']}{extra}")
         prompt = (
             "Scrivi ESATTAMENTE 4 righe brevissime (max 11 parole l'una) in italiano come sintesi esecutiva "
-            "su: 1) Italia governo/economia, 2) Mercati, 3) Scioperi/Rischi, 4) Novara/Tech.\n"
+            "su: 1) Italia governo/economia, 2) Mercati, 3) Trasporti/Rischi, 4) Tech/Novara.\n"
+            "Usa SOLO fatti presenti nei titoli forniti: nessun numero, nome o dettaglio che non compaia. "
+            "Se per un tema non ci sono notizie rilevanti scrivilo in modo esplicito (tono [GREEN]).\n"
+            "Nella riga 4 dai priorità a un eventuale disservizio in corso di servizi digitali.\n"
             "Inizia ogni riga con [RED], [AMBER] o [GREEN] in base alla criticità/tono.\n"
             "Nessuna introduzione o testo extra.\n\n" + "\n".join(lines)
         )
-        try:
-            r = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=18,
-            )
-            r.raise_for_status()
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw = gemini(prompt, as_json=False, timeout=30)
+        if raw:
             parsed = []
             for ln in raw.splitlines():
                 m = re.match(r"\[(RED|AMBER|GREEN)\]\s*(.+)", ln.strip(), re.I)
@@ -353,10 +1036,8 @@ def build_brief_bullets(collected: dict, strike_alert: bool) -> list[tuple[str, 
                     parsed.append((m.group(1).lower(), m.group(2).strip()))
             if len(parsed) >= 3:
                 return parsed[:4]
-        except Exception as e:
-            print(f"Warn: Gemini brief skipped: {e}")
 
-    # Deterministic fallback (no AI key needed)
+    # Fallback deterministico (nessuna chiave AI necessaria)
     bullets = []
     if collected["italy"]:
         bullets.append(("amber", collected["italy"][0]["title"]))
@@ -366,7 +1047,10 @@ def build_brief_bullets(collected: dict, strike_alert: bool) -> list[tuple[str, 
         bullets.append(("red", f"Trasporti: {collected['strikes'][0]['title']}"))
     else:
         bullets.append(("green", "Trasporti e voli: nessuna criticità immediata rilevata"))
-    if collected["novara"]:
+    tech_alert = next((it for it in collected["tech"] if it["must"]), None)
+    if tech_alert:
+        bullets.append(("amber", f"Tech: {tech_alert['title']}"))
+    elif collected["novara"]:
         bullets.append(("green", f"Novara: {collected['novara'][0]['title']}"))
     elif collected["sanity"]:
         bullets.append(("amber", collected["sanity"][0]["title"]))
@@ -737,7 +1421,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <div class="quote-card">
-      “Aggiornato ogni ora 08:00–20:00 (Milano). Zero ads, zero algoritmo, solo fonti dirette.”
+      “__EDITION_NOTE__”
       <span>Edizione generata alle __UPDATE_TIME__</span>
     </div>
   </main>
@@ -870,6 +1554,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+def stable_id(text: str) -> str:
+    """ID stabile tra una build e l'altra (hash() di Python cambia a ogni esecuzione)."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+
+
 def build_html():
     now_utc = datetime.now(timezone.utc)
     now_it = now_utc.astimezone(TZ_IT)
@@ -877,9 +1566,21 @@ def build_html():
     weather_icon, weather_temp = fetch_weather_novara()
     market_cards = fetch_markets()
 
+    # 1) Raccolta + deduplica + punteggio  2) selezione (AI se disponibile, altrimenti euristica)
+    cache = prefetch_feeds()
     collected = {}
     for sec in SECTIONS:
-        collected[sec["id"]] = collect_section(sec, now_utc)
+        ranked = rank_section(sec, now_utc, cache)
+        collected[sec["id"]] = select_section(sec, ranked)
+        print(f"[{sec['id']}] candidati={len(ranked)} selezionati={len(collected[sec['id']])}")
+        if has_translator():
+            time.sleep(0.5)
+
+    # 3) Traduzione fedele di ciò che non è in italiano
+    all_chosen = [it for items in collected.values() for it in items]
+    translate_to_italian(all_chosen)
+    for it in all_chosen:
+        it["age"] = rel_age(it["dt"], now_utc)
 
     strike_items = collected.get("strikes", [])
     strike_alert = any(
@@ -927,8 +1628,9 @@ def build_html():
         for name, val, cls, col, pct in kpis
     )
 
-    # Pick Top Stories (best 1-2 per section with preference for items with images/alerts)
+    # Top Stories = le 2 notizie più importanti di ogni sezione; il resto va in Late News
     all_articles = []
+    all_dts = []
     top_indices = []
     late_indices = []
 
@@ -942,12 +1644,10 @@ def build_html():
     }
 
     for sec in SECTIONS:
-        sec_items = collected[sec["id"]]
-        # Prioritize stories with images for Top Stories slot, keep chronological for rest
-        top_picks = sorted(sec_items[:3], key=lambda x: bool(x["image"]), reverse=True)[:2]
-        top_titles = {it["title"] for it in top_picks}
-        for it in sec_items:
+        for pos, it in enumerate(collected[sec["id"]]):
             idx = len(all_articles)
+            cov = it.get("coverage", 1)
+            source_label = f"{it['source']} +{cov - 1}" if cov > 1 else it["source"]
             all_articles.append({
                 "sec_id": it["sec_id"],
                 "sec_label": it["sec_label"],
@@ -955,15 +1655,14 @@ def build_html():
                 "link": it["link"],
                 "summary": it["summary"],
                 "image": it["image"],
-                "source": it["source"],
+                "source": source_label,
                 "tag": it["tag"],
                 "age": it["age"],
             })
-            if it["title"] in top_titles and len(top_picks) > 0:
-                top_indices.append(idx)
-                top_titles.discard(it["title"])
-            else:
-                late_indices.append(idx)
+            all_dts.append(it["dt"])
+            (top_indices if pos < 2 else late_indices).append(idx)
+
+    late_indices.sort(key=lambda i: all_dts[i], reverse=True)
 
     # Top Stories HTML
     top_cards = []
@@ -972,7 +1671,7 @@ def build_html():
         tone_cls, dot_col, badge_txt = tone_map.get(art["sec_id"], ("tone-blue", "var(--cyan)", art["sec_label"]))
         if art["sec_id"] == "strikes" and strike_alert:
             tone_cls, dot_col, badge_txt = "tone-red", "var(--red)", "SCIOPERO / DISAGI"
-        uid = f"t-{abs(hash(art['title'])) % 999999}"
+        uid = f"t-{stable_id(art['link'])}"
         img_html = f'<img class="story-thumb" src="{html.escape(art["image"], quote=True)}" loading="lazy" alt="">' if art["image"] else ""
         desc_html = f'<p class="story-desc">{html.escape(art["summary"])}</p>' if art["summary"] else ""
         top_cards.append(f"""
@@ -998,7 +1697,7 @@ def build_html():
     late_rows = []
     for idx in late_indices:
         art = all_articles[idx]
-        uid = f"l-{abs(hash(art['title'])) % 999999}"
+        uid = f"l-{stable_id(art['link'])}"
         late_rows.append(f"""
         <div class="late-row" data-idx="{idx}" data-sec="{art['sec_id']}" data-uid="{uid}">
           <span class="late-age">{html.escape(art['age'])}</span>
@@ -1006,11 +1705,22 @@ def build_html():
           <span class="late-cat">{html.escape(art['sec_label'])}</span>
         </div>""")
 
-    days_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    months_en = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    date_label = f"{days_en[now_it.weekday()]}, {now_it.day} {months_en[now_it.month - 1]}"
+    days_it = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+    months_it = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"]
+    date_label = f"{days_it[now_it.weekday()]} {now_it.day} {months_it[now_it.month - 1]}"
     stability_pct = 55 if strike_alert else 90
     stability_label = "Attenzione" if strike_alert else "Regolare"
+
+    if has_translator():
+        edition_note = (
+            "Aggiornato ogni ora 08:00–20:00 (Milano). Fonti dirette e titoli originali: "
+            "l'AI sceglie e traduce, non riscrive."
+        )
+    else:
+        edition_note = (
+            "Aggiornato ogni ora 08:00–20:00 (Milano). Fonti dirette e titoli originali, "
+            "ordinati per rilevanza."
+        )
 
     articles_json = json.dumps(all_articles, ensure_ascii=False).replace("</", "<\\/")
 
@@ -1027,6 +1737,7 @@ def build_html():
         .replace("__KPI_HTML__", kpi_html)
         .replace("__TOP_STORIES_HTML__", "".join(top_cards))
         .replace("__LATE_NEWS_HTML__", "".join(late_rows) or '<div class="late-row"><span class="late-title">Nessun altro aggiornamento.</span></div>')
+        .replace("__EDITION_NOTE__", html.escape(edition_note))
         .replace("__ARTICLES_JSON__", articles_json)
     )
 
