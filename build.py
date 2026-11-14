@@ -1713,7 +1713,7 @@ def build_html():
 
     if has_translator():
         edition_note = (
-            "Aggiornato ogni ora 08:00–20:00 (Milano). Fonti dirette e titoli originali: "
+            "Aggiornato ogni ora. Fonti dirette e titoli originali: "
             "l'AI sceglie e traduce, non riscrive."
         )
     else:
