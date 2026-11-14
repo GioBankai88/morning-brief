@@ -2,7 +2,7 @@ name: Daily Brief
 
 on:
   schedule:
-    - cron: "7 6-21 * * *"
+    - cron: "5 7-20 * * *"
   workflow_dispatch:
   push:
     paths:
